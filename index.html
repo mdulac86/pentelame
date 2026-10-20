@@ -38,6 +38,7 @@
  <button id="bRecon" class="vert" style="display:none">RECONNECTER</button>
  <button id="bChercher">CONNECTER UNE MACHINE</button>
  <div id="cStatut"></div>
+ <div id="cDetail" style="font-size:2.6vw;color:#f97316;max-width:90vw"></div>
  <div id="cAide">
   Bluetooth de la tablette activé. La première fois, Chrome demande d’autoriser
   « Appareils à proximité » : accepter.<br>
@@ -208,22 +209,44 @@ function garderPage(h, html) {
 
 // ---- Connexion ----
 const avecEcoute = new WeakSet();
+let etape = '', essais = 0, minuterie = null;
+function planifier(ms) { clearTimeout(minuterie); minuterie = setTimeout(reconnecter, ms); }
+const pause = ms => new Promise(r => setTimeout(r, ms));
+function avecDelai(p, ms) {
+  return Promise.race([p, new Promise((_, ko) => setTimeout(() => ko(new Error('délai dépassé')), ms))]);
+}
+function detail(e) {
+  const t = 'Étape ' + etape + ' : ' + (e && (e.name ? e.name + ' – ' : '') + (e && e.message || e));
+  const el = $c('cDetail'); if (el) el.textContent = t;
+  console.log('[BT]', t);
+}
 async function connecter(d) {
   if (enCours) return; enCours = true;
   try {
     dev = d;
     if (!avecEcoute.has(dev)) { dev.addEventListener('gattserverdisconnected', perdu); avecEcoute.add(dev); }
     statut('Connexion à ' + (dev.name || 'la machine') + '…');
-    const srv = await dev.gatt.connect();
-    const svc = await srv.getPrimaryService(SVC);
+    etape = '1 connexion';
+    const srv = await avecDelai(dev.gatt.connect(), 15000);
+    // Android : la liste des services n'est pas toujours prete tout de suite
+    etape = '2 service';
+    let svc = null;
+    for (let i = 0; i < 4 && !svc; i++) {
+      try { svc = await srv.getPrimaryService(SVC); }
+      catch (e) { if (i === 3) throw e; await pause(700); }
+    }
+    etape = '3 caracteristiques';
     const cD = await svc.getCharacteristic(C_DATA), cR = await svc.getCharacteristic(C_REP),
           cP = await svc.getCharacteristic(C_PAGE), cC = await svc.getCharacteristic(C_CMD),
           cI = await svc.getCharacteristic(C_INFO);
+    etape = '4 notifications';
     cD.addEventListener('characteristicvaluechanged', surData); await cD.startNotifications();
     cR.addEventListener('characteristicvaluechanged', surRep);  await cR.startNotifications();
     cP.addEventListener('characteristicvaluechanged', surPage); await cP.startNotifications();
     chCmd = cC; repMorceaux = []; dataMorceaux = [];
+    etape = '5 info';
     const info = JSON.parse(dec.decode(await cI.readValue()));
+    etape = '6 ecran';
     try { localStorage.setItem('derniere', dev.name || ''); } catch (_) {}
     if (!ecranCharge) {
       machine = info;
@@ -235,19 +258,23 @@ async function connecter(d) {
       location.reload();   // autre machine ou nouveau programme dans l'ESP32
       return;
     }
-    etat(true);
+    etat(true); essais = 0;
+    const el = $c('cDetail'); if (el) el.textContent = '';
+  } catch (e) {
+    detail(e);
+    throw e;
   } finally { enCours = false; }
 }
 function perdu() {
   chCmd = null;
   if (manuel) return;
   if (ecranCharge) etat(false); else statut('Connexion perdue.');
-  setTimeout(reconnecter, 1000);
+  planifier(1000);
 }
 async function reconnecter() {
   if (manuel || !dev || (dev.gatt && dev.gatt.connected && chCmd)) return;
   try { await connecter(dev); }
-  catch (e) { if (!ecranCharge) statut('Machine introuvable, nouvel essai…'); setTimeout(reconnecter, 2000); }
+  catch (e) { essais++; if (!ecranCharge) statut('Machine introuvable, nouvel essai (' + essais + ')…'); planifier(2000); }
 }
 
 async function chercher() {
@@ -257,7 +284,7 @@ async function chercher() {
     d = await navigator.bluetooth.requestDevice({ filters: [{ namePrefix: 'PENTE-' }], optionalServices: [SVC] });
   } catch (e) { statut('Aucune machine choisie.'); return; }
   eveil();
-  try { await connecter(d); } catch (e) { statut('Erreur : ' + e.message); setTimeout(reconnecter, 2000); }
+  try { await connecter(d); } catch (e) { statut('Erreur : ' + e.message); planifier(2000); }
 }
 
 badge.addEventListener('click', () => {
@@ -288,7 +315,7 @@ if (!navigator.bluetooth) {
     if (!d) return;
     const b = $c('bRecon');
     b.textContent = 'RECONNECTER ' + d.name; b.style.display = '';
-    b.addEventListener('click', () => { eveil(); connecter(d).catch(e => { statut('Erreur : ' + e.message); setTimeout(reconnecter, 2000); }); });
+    b.addEventListener('click', () => { eveil(); connecter(d).catch(e => { statut('Erreur : ' + e.message); planifier(2000); }); });
     statut('Recherche de ' + d.name + '…');
     dev = d;
     connecter(d).catch(() => { statut('Appuie sur RECONNECTER quand la machine est en marche.'); });

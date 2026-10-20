@@ -63,7 +63,7 @@ perte.innerHTML = '⚠ PAS DE SIGNAL<small>Bluetooth : reconnexion automatique e
 let dev = null, chCmd = null, machine = null, ecranCharge = false, manuel = false, enCours = false;
 let lastData = null, lastT = 0, attenteData = [];
 let dataMorceaux = [], repMorceaux = [], reps = {}, prochainId = 1;
-let pageMorceaux = [], pageRecu = 0, pageAttendue = 0, pageFin = null;
+let pageBuf = null, pageOk = null, pageRecu = 0, pageDernier = 0;
 let fileEcriture = Promise.resolve();
 
 function statut(t) { const s = $c('cStatut'); if (s) s.textContent = t; }
@@ -103,13 +103,20 @@ function surRep(e) {
   const id = t.slice(0, a), f = reps[id];
   if (f) { delete reps[id]; f({ code: parseInt(t.slice(a + 1, z)) || 200, texte: t.slice(z + 1) }); }
 }
-// PAGE : la page de l'ecran, taille connue d'avance (INFO)
+// PAGE : morceaux = [decalage sur 3 octets][donnees]. Taille connue d'avance (INFO).
 function surPage(e) {
-  if (!pageFin) return;
-  const b = octets(e);
-  pageMorceaux.push(b); pageRecu += b.length;
-  statut('Chargement de l’écran… ' + Math.min(100, Math.round(pageRecu * 100 / pageAttendue)) + ' %');
-  if (pageRecu >= pageAttendue) { const f = pageFin; pageFin = null; f(dec.decode(coller(pageMorceaux))); pageMorceaux = []; }
+  if (!pageBuf) return;
+  const b = octets(e); if (b.length < 4) return;
+  const off = b[0] | (b[1] << 8) | (b[2] << 16), d = b.subarray(3);
+  if (off + d.length > pageBuf.length) return;
+  pageBuf.set(d, off);
+  for (let i = off; i < off + d.length; i++) if (!pageOk[i]) { pageOk[i] = 1; pageRecu++; }
+  pageDernier = Date.now();
+  statut('Chargement de l’écran… ' + Math.min(100, Math.floor(pageRecu * 100 / pageBuf.length)) + ' %');
+}
+function premierTrou(depuis) {
+  for (let i = depuis; i < pageOk.length; i++) if (!pageOk[i]) return i;
+  return -1;
 }
 
 // ---- Envoi des commandes (une a la fois) ----
@@ -188,14 +195,28 @@ function injecter(html) {
   for (const t of scripts) { const s = document.createElement('script'); s.textContent = t; document.body.appendChild(s); }
 }
 
+// La tablette demande la page par fenetres de 2 ko ; s'il manque un morceau,
+// elle redemande a partir du trou (rien ne bloque si le Bluetooth en perd).
 async function chargerPage(n) {
-  pageMorceaux = []; pageRecu = 0; pageAttendue = n;
-  const p = new Promise((ok, ko) => {
-    pageFin = ok;
-    setTimeout(() => { if (pageFin) { pageFin = null; ko(new Error('chargement trop long')); } }, 90000);
-  });
-  await commande('PAGE', 10000);
-  return p;
+  pageBuf = new Uint8Array(n); pageOk = new Uint8Array(n); pageRecu = 0;
+  const debut = Date.now();
+  try {
+    let trou = 0;
+    while ((trou = premierTrou(0)) >= 0) {
+      if (Date.now() - debut > 120000) throw new Error('chargement trop long');
+      if (!chCmd) throw new Error('Bluetooth coupé pendant le chargement');
+      const fin = Math.min(n, trou + 2048);
+      pageDernier = Date.now();
+      await commande('PAGE?o=' + trou, 6000);
+      // attendre la fenetre (ou 1,2 s sans nouveau morceau)
+      while (Date.now() - pageDernier < 1200) {
+        const t = premierTrou(trou);
+        if (t < 0 || t >= fin) break;
+        await pause(40);
+      }
+    }
+    return dec.decode(pageBuf);
+  } finally { pageBuf = null; }
 }
 function garderPage(h, html) {
   try {

@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<meta name="theme-color" content="#000000">
+<title>Niveau de lame</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png">
+<style>
+ /* Styles de la coque seulement (prefixes) : la page de la machine apporte les siens */
+ html,body{margin:0;background:#000;color:#fff}
+ #coque{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;
+        gap:3vh;padding:4vw;box-sizing:border-box;font-family:Arial,Helvetica,sans-serif;text-align:center;background:#000}
+ #coque h1{margin:0;font-size:7vw;letter-spacing:.05em}
+ #coque h1 b{color:#22c55e}
+ #coque .sous{color:#8a929c;font-size:3.2vw}
+ #coque button{font-size:5vw;font-weight:bold;padding:3vh 6vw;border:0;border-radius:16px;
+               background:#1d4ed8;color:#fff;width:80vw;max-width:700px}
+ #coque button.vert{background:#15803d}
+ #coque button:disabled{opacity:.5}
+ #cStatut{font-size:3.8vw;min-height:5vw;color:#facc15}
+ #cAide{font-size:2.8vw;color:#6b7280;max-width:90vw;line-height:1.4}
+ #btBadge{position:fixed;right:8px;top:6px;z-index:99999;font:bold 13px Arial,Helvetica,sans-serif;
+          padding:3px 9px;border-radius:99px;background:#14532d;color:#bbf7d0;opacity:.8;
+          border:1px solid #22c55e;user-select:none;-webkit-user-select:none}
+ #btPerte{position:fixed;inset:0;z-index:99998;display:none;flex-direction:column;align-items:center;justify-content:center;
+          background:rgba(70,70,70,.82);color:#fff;font:bold 6vw Arial,Helvetica,sans-serif;text-align:center;pointer-events:none}
+ #btPerte small{font-size:3vw;font-weight:normal;color:#e5e7eb;margin-top:2vh}
+ #btBadge.perdu{background:#7c2d12;color:#fed7aa;border-color:#f97316;animation:btClig 1s infinite}
+ @keyframes btClig{50%{opacity:.35}}
+</style>
+</head>
+<body>
+<div id="coque">
+ <h1>NIVEAU DE <b>LAME</b></h1>
+ <div class="sous">Dulac et fils · connexion Bluetooth</div>
+ <button id="bRecon" class="vert" style="display:none">RECONNECTER</button>
+ <button id="bChercher">CONNECTER UNE MACHINE</button>
+ <div id="cStatut"></div>
+ <div id="cAide">
+  Bluetooth de la tablette activé. La première fois, Chrome demande d’autoriser
+  « Appareils à proximité » : accepter.<br>
+  Dans la liste, choisir <b>PENTE-LAME</b> (259D3) ou <b>PENTE-D5K</b>.<br>
+  L’écran de la machine est chargé une seule fois puis gardé dans la tablette.
+ </div>
+</div>
+
+<script>
+(() => {
+'use strict';
+// ---- Identifiants Bluetooth (identiques dans le code ESP32) ----
+const U = n => '6e1f000' + n + '-5a4c-4d2b-9c3e-7d1a2b3c4d5e';
+const SVC = U(1), C_DATA = U(2), C_CMD = U(3), C_REP = U(4), C_PAGE = U(5), C_INFO = U(6);
+
+const dec = new TextDecoder(), enc = new TextEncoder();
+const $c = id => document.getElementById(id);
+const badge = document.createElement('div'); badge.id = 'btBadge'; badge.textContent = 'BT';
+const perte = document.createElement('div'); perte.id = 'btPerte';
+perte.innerHTML = '⚠ PAS DE SIGNAL<small>Bluetooth : reconnexion automatique en cours…<br>Vérifie que la machine est en marche.</small>';
+
+let dev = null, chCmd = null, machine = null, ecranCharge = false, manuel = false, enCours = false;
+let lastData = null, lastT = 0, attenteData = [];
+let dataMorceaux = [], repMorceaux = [], reps = {}, prochainId = 1;
+let pageMorceaux = [], pageRecu = 0, pageAttendue = 0, pageFin = null;
+let fileEcriture = Promise.resolve();
+
+function statut(t) { const s = $c('cStatut'); if (s) s.textContent = t; }
+function octets(e) { const v = e.target.value; return new Uint8Array(v.buffer.slice(v.byteOffset, v.byteOffset + v.byteLength)); }
+function coller(liste) {
+  let n = 0; for (const b of liste) n += b.length;
+  const r = new Uint8Array(n); let p = 0;
+  for (const b of liste) { r.set(b, p); p += b.length; }
+  return r;
+}
+function etat(ok) {
+  badge.classList.toggle('perdu', !ok);
+  badge.textContent = ok ? 'BT ● ' + (dev ? dev.name : '') : 'BT perdu · reconnexion…';
+}
+
+// ---- Reception ----
+// DATA : JSON envoye en morceaux ; commence par "{" et finit par "}"
+function surData(e) {
+  const b = octets(e); if (!b.length) return;
+  if (b[0] === 0x7B) dataMorceaux = [];
+  dataMorceaux.push(b);
+  if (b[b.length - 1] === 0x7D) {
+    const t = dec.decode(coller(dataMorceaux)); dataMorceaux = [];
+    try { JSON.parse(t); } catch (_) { return; }
+    lastData = t; lastT = Date.now();
+    attenteData.splice(0).forEach(f => f());
+  }
+}
+// REP : "id|code|texte" + 0x04
+function surRep(e) {
+  const b = octets(e); if (!b.length) return;
+  repMorceaux.push(b);
+  if (b[b.length - 1] !== 0x04) return;
+  const t = dec.decode(coller(repMorceaux)).slice(0, -1); repMorceaux = [];
+  const a = t.indexOf('|'), z = t.indexOf('|', a + 1);
+  if (a < 0 || z < 0) return;
+  const id = t.slice(0, a), f = reps[id];
+  if (f) { delete reps[id]; f({ code: parseInt(t.slice(a + 1, z)) || 200, texte: t.slice(z + 1) }); }
+}
+// PAGE : la page de l'ecran, taille connue d'avance (INFO)
+function surPage(e) {
+  if (!pageFin) return;
+  const b = octets(e);
+  pageMorceaux.push(b); pageRecu += b.length;
+  statut('Chargement de l’écran… ' + Math.min(100, Math.round(pageRecu * 100 / pageAttendue)) + ' %');
+  if (pageRecu >= pageAttendue) { const f = pageFin; pageFin = null; f(dec.decode(coller(pageMorceaux))); pageMorceaux = []; }
+}
+
+// ---- Envoi des commandes (une a la fois) ----
+function ecrire(t) {
+  const p = fileEcriture.then(() => {
+    if (!chCmd) throw new TypeError('Bluetooth non connecté');
+    const d = enc.encode(t);
+    return chCmd.writeValueWithResponse ? chCmd.writeValueWithResponse(d) : chCmd.writeValue(d);
+  });
+  fileEcriture = p.catch(() => {});
+  return p;
+}
+function commande(chemin, delai) {
+  if (!chCmd) return Promise.reject(new TypeError('Bluetooth non connecté'));
+  const id = String(prochainId); prochainId = prochainId % 9999 + 1;
+  return new Promise((ok, ko) => {
+    const to = setTimeout(() => { delete reps[id]; ko(new TypeError('pas de réponse')); }, delai || 4000);
+    reps[id] = r => { clearTimeout(to); ok(r); };
+    ecrire(id + '|' + chemin).catch(e => { clearTimeout(to); delete reps[id]; ko(e); });
+  });
+}
+
+// ---- La page de la machine appelle fetch('/data'), fetch('/reg?...') etc.
+//      On fait passer ces appels par le Bluetooth : la page reste identique a la version Wi-Fi.
+const fetchOrig = window.fetch.bind(window);
+function reponse(t, code, type) {
+  return new Response(t, { status: code, headers: { 'Content-Type': type + '; charset=utf-8' } });
+}
+window.fetch = function (url, opts) {
+  const u = typeof url === 'string' ? url : (url && url.url) || '';
+  if (!u.startsWith('/')) return fetchOrig(url, opts);
+  if (u === '/data') {
+    if (lastData && Date.now() - lastT < 600) return Promise.resolve(reponse(lastData, 200, 'application/json'));
+    return new Promise((ok, ko) => {
+      const f = () => { clearTimeout(to); ok(reponse(lastData, 200, 'application/json')); };
+      const to = setTimeout(() => {
+        const i = attenteData.indexOf(f); if (i >= 0) attenteData.splice(i, 1);
+        ko(new TypeError('pas de données'));
+      }, 1200);
+      attenteData.push(f);
+    });
+  }
+  return commande(u).then(r => reponse(r.texte, r.code, 'text/plain'));
+};
+// Liens internes (ex. page CAN) : seulement par le Wi-Fi
+document.addEventListener('click', e => {
+  const a = e.target.closest && e.target.closest('a[href^="/"]');
+  if (!a) return;
+  e.preventDefault();
+  alert('Cette page est disponible seulement par le Wi-Fi de la machine (http://192.168.4.1' + a.getAttribute('href') + ').');
+}, true);
+
+// ---- Ecran toujours allume ----
+let verrouEveil = null;
+async function eveil() {
+  try { if ('wakeLock' in navigator && document.visibilityState === 'visible' && !verrouEveil) {
+    verrouEveil = await navigator.wakeLock.request('screen');
+    verrouEveil.addEventListener('release', () => { verrouEveil = null; });
+  } } catch (_) {}
+}
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') eveil(); });
+
+// ---- Installer l'ecran de la machine dans cette page ----
+function injecter(html) {
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  doc.querySelectorAll('style').forEach(s => {
+    const n = document.createElement('style'); n.textContent = s.textContent; document.head.appendChild(n);
+  });
+  if (doc.title) document.title = doc.title;
+  const scripts = [...doc.querySelectorAll('script')].map(s => s.textContent);
+  doc.querySelectorAll('script').forEach(s => s.remove());
+  document.body.className = doc.body.className;
+  document.body.innerHTML = doc.body.innerHTML;
+  document.body.appendChild(perte);
+  document.body.appendChild(badge);
+  for (const t of scripts) { const s = document.createElement('script'); s.textContent = t; document.body.appendChild(s); }
+}
+
+async function chargerPage(n) {
+  pageMorceaux = []; pageRecu = 0; pageAttendue = n;
+  const p = new Promise((ok, ko) => {
+    pageFin = ok;
+    setTimeout(() => { if (pageFin) { pageFin = null; ko(new Error('chargement trop long')); } }, 90000);
+  });
+  await commande('PAGE', 10000);
+  return p;
+}
+function garderPage(h, html) {
+  try {
+    for (let i = localStorage.length - 1; i >= 0; i--) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith('page_' + machine.m + '_')) localStorage.removeItem(k);
+    }
+    localStorage.setItem('page_' + machine.m + '_' + h, html);
+  } catch (_) {}
+}
+
+// ---- Connexion ----
+const avecEcoute = new WeakSet();
+async function connecter(d) {
+  if (enCours) return; enCours = true;
+  try {
+    dev = d;
+    if (!avecEcoute.has(dev)) { dev.addEventListener('gattserverdisconnected', perdu); avecEcoute.add(dev); }
+    statut('Connexion à ' + (dev.name || 'la machine') + '…');
+    const srv = await dev.gatt.connect();
+    const svc = await srv.getPrimaryService(SVC);
+    const cD = await svc.getCharacteristic(C_DATA), cR = await svc.getCharacteristic(C_REP),
+          cP = await svc.getCharacteristic(C_PAGE), cC = await svc.getCharacteristic(C_CMD),
+          cI = await svc.getCharacteristic(C_INFO);
+    cD.addEventListener('characteristicvaluechanged', surData); await cD.startNotifications();
+    cR.addEventListener('characteristicvaluechanged', surRep);  await cR.startNotifications();
+    cP.addEventListener('characteristicvaluechanged', surPage); await cP.startNotifications();
+    chCmd = cC; repMorceaux = []; dataMorceaux = [];
+    const info = JSON.parse(dec.decode(await cI.readValue()));
+    try { localStorage.setItem('derniere', dev.name || ''); } catch (_) {}
+    if (!ecranCharge) {
+      machine = info;
+      let html = null;
+      try { html = localStorage.getItem('page_' + info.m + '_' + info.h); } catch (_) {}
+      if (!html) { html = await chargerPage(info.n); garderPage(info.h, html); }
+      injecter(html); ecranCharge = true;
+    } else if (info.m !== machine.m || info.h !== machine.h) {
+      location.reload();   // autre machine ou nouveau programme dans l'ESP32
+      return;
+    }
+    etat(true);
+  } finally { enCours = false; }
+}
+function perdu() {
+  chCmd = null;
+  if (manuel) return;
+  if (ecranCharge) etat(false); else statut('Connexion perdue.');
+  setTimeout(reconnecter, 1000);
+}
+async function reconnecter() {
+  if (manuel || !dev || (dev.gatt && dev.gatt.connected && chCmd)) return;
+  try { await connecter(dev); }
+  catch (e) { if (!ecranCharge) statut('Machine introuvable, nouvel essai…'); setTimeout(reconnecter, 2000); }
+}
+
+async function chercher() {
+  if (!navigator.bluetooth) { statut('Bluetooth web indisponible : utiliser Chrome sur Android, adresse https.'); return; }
+  let d;
+  try {
+    d = await navigator.bluetooth.requestDevice({ filters: [{ namePrefix: 'PENTE-' }], optionalServices: [SVC] });
+  } catch (e) { statut('Aucune machine choisie.'); return; }
+  eveil();
+  try { await connecter(d); } catch (e) { statut('Erreur : ' + e.message); setTimeout(reconnecter, 2000); }
+}
+
+badge.addEventListener('click', () => {
+  if (confirm('Se déconnecter et choisir une autre machine ?')) {
+    manuel = true;
+    try { dev && dev.gatt.disconnect(); } catch (_) {}
+    location.reload();
+  }
+});
+
+// Plus de mesure depuis 3 s : ecran gris par-dessus (meme si la page de la machine ne le fait pas)
+setInterval(() => {
+  if (!ecranCharge) return;
+  perte.style.display = (Date.now() - lastT > 3000) ? 'flex' : 'none';
+}, 500);
+
+// ---- Demarrage ----
+$c('bChercher').addEventListener('click', chercher);
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+if (!navigator.bluetooth) {
+  statut('Bluetooth web indisponible ici : ouvrir avec Chrome sur la tablette Android.');
+  $c('bChercher').disabled = true;
+} else if (navigator.bluetooth.getDevices) {
+  // Machine deja autorisee : reconnexion directe
+  navigator.bluetooth.getDevices().then(liste => {
+    let nom = ''; try { nom = localStorage.getItem('derniere') || ''; } catch (_) {}
+    const d = liste.find(x => x.name === nom) || liste.find(x => (x.name || '').startsWith('PENTE-'));
+    if (!d) return;
+    const b = $c('bRecon');
+    b.textContent = 'RECONNECTER ' + d.name; b.style.display = '';
+    b.addEventListener('click', () => { eveil(); connecter(d).catch(e => { statut('Erreur : ' + e.message); setTimeout(reconnecter, 2000); }); });
+    statut('Recherche de ' + d.name + '…');
+    dev = d;
+    connecter(d).catch(() => { statut('Appuie sur RECONNECTER quand la machine est en marche.'); });
+  }).catch(() => {});
+}
+})();
+</script>
+</body>
+</html>

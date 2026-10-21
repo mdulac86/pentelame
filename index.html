@@ -29,6 +29,15 @@
  #btPerte small{font-size:3vw;font-weight:normal;color:#e5e7eb;margin-top:2vh}
  #btBadge.perdu{background:#7c2d12;color:#fed7aa;border-color:#f97316;animation:btClig 1s infinite}
  @keyframes btClig{50%{opacity:.35}}
+ #btMenu{position:fixed;inset:0;z-index:100000;display:none;align-items:center;justify-content:center;
+         background:rgba(0,0,0,.75);font-family:Arial,Helvetica,sans-serif}
+ #btMenu .boite{background:#111827;border:1px solid #374151;border-radius:16px;padding:3vh 4vw;
+         display:flex;flex-direction:column;gap:2vh;min-width:60vw;text-align:center;color:#fff}
+ #btMenu .boite div{font-size:3vw;color:#9ca3af}
+ #btMenu button{font:bold 3.6vw Arial,Helvetica,sans-serif;padding:2.2vh 3vw;border:0;border-radius:12px;
+         background:#1d4ed8;color:#fff}
+ #btMenu button.gris{background:#374151}
+ #btMenu button.rouge{background:#7f1d1d}
 </style>
 </head>
 <body>
@@ -39,6 +48,7 @@
  <button id="bChercher">CONNECTER UNE MACHINE</button>
  <div id="cStatut"></div>
  <div id="cDetail" style="font-size:2.6vw;color:#f97316;max-width:90vw"></div>
+ <button id="bJournal" style="background:#374151;font-size:3.2vw;padding:1.6vh 4vw;width:auto">📄 JOURNAL D’ERREURS</button>
  <div id="cAide">
   Bluetooth de la tablette activé. La première fois, Chrome demande d’autoriser
   « Appareils à proximité » : accepter.<br>
@@ -59,6 +69,85 @@ const $c = id => document.getElementById(id);
 const badge = document.createElement('div'); badge.id = 'btBadge'; badge.textContent = 'BT';
 const perte = document.createElement('div'); perte.id = 'btPerte';
 perte.innerHTML = '⚠ PAS DE SIGNAL<small>Bluetooth : reconnexion automatique en cours…<br>Vérifie que la machine est en marche.</small>';
+
+// ---- Journal de la tablette (gardé dans la tablette, 400 dernières lignes) ----
+const CLE_JOURNAL = 'journal_tablette';
+function jlog(t) {
+  const d = new Date(), z = n => String(n).padStart(2, '0');
+  const l = d.getFullYear() + '-' + z(d.getMonth() + 1) + '-' + z(d.getDate()) + ' ' +
+            z(d.getHours()) + ':' + z(d.getMinutes()) + ':' + z(d.getSeconds()) + '  ' + t;
+  try {
+    let a = JSON.parse(localStorage.getItem(CLE_JOURNAL) || '[]');
+    a.push(l); if (a.length > 400) a = a.slice(-400);
+    localStorage.setItem(CLE_JOURNAL, JSON.stringify(a));
+  } catch (_) {}
+  console.log('[JOURNAL]', l);
+}
+function journalTablette() { try { return JSON.parse(localStorage.getItem(CLE_JOURNAL) || '[]'); } catch (_) { return []; } }
+
+// Lit le journal de l'ESP32 par morceaux de 400 caractères (redemande si un morceau se perd)
+async function journalESP() {
+  if (!chCmd) return '(ESP32 non connecté : journal de l’ESP32 non lu)\n';
+  let txt = '';
+  for (let o = 0, n = 0; n < 60; n++) {
+    let r = null;
+    for (let k = 0; k < 3 && !r; k++) { try { r = await commande('/journal?o=' + o, 4000); } catch (_) {} }
+    if (!r) { txt += '\n[lecture incomplète : connexion perdue]\n'; break; }
+    if (r.code !== 200) { txt += '\n[l’ESP32 ne connaît pas /journal : programme pas à jour]\n'; break; }
+    if (!r.texte) break;
+    txt += r.texte; o += r.texte.length;
+  }
+  return txt;
+}
+async function telechargerJournal(b) {
+  const ancien = b ? b.textContent : '';
+  if (b) { b.disabled = true; b.textContent = 'Lecture du journal…'; }
+  try {
+    const esp = await journalESP();
+    const d = new Date(), z = n => String(n).padStart(2, '0');
+    const nom = 'journal-pente-' + d.getFullYear() + z(d.getMonth() + 1) + z(d.getDate()) + '-' + z(d.getHours()) + z(d.getMinutes()) + '.txt';
+    const txt = 'JOURNAL NIVEAU DE LAME - ' + d.toLocaleString('fr-CA') + '\n' +
+      'Machine : ' + (dev ? dev.name : '(aucune)') + ' · ' + navigator.userAgent + '\n\n' +
+      '=========== ESP32 (capteur) ===========\n' +
+      '#N = numéro de démarrage de l’ESP32. Raison 0x08 = signal perdu, 0x13 = fermé par la tablette.\n' +
+      esp + '\n=========== TABLETTE ===========\n' + journalTablette().join('\n') + '\n';
+    const url = URL.createObjectURL(new Blob([txt], { type: 'text/plain' }));
+    const a = document.createElement('a'); a.href = url; a.download = nom;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+    jlog('Journal téléchargé : ' + nom);
+    alert('Journal enregistré dans « Téléchargements » :\n' + nom + '\n\nEnvoie-le pour le diagnostic.');
+  } finally { if (b) { b.disabled = false; b.textContent = ancien; } }
+}
+async function effacerJournal() {
+  if (!confirm('Effacer le journal de la tablette ET celui de l’ESP32 ?')) return;
+  try { localStorage.removeItem(CLE_JOURNAL); } catch (_) {}
+  if (chCmd) { try { await commande('/journal?effacer=1'); } catch (_) {} }
+  jlog('Journal effacé');
+}
+// Menu du badge BT
+const menu = document.createElement('div'); menu.id = 'btMenu';
+menu.innerHTML = '<div class="boite"><div id="mTitre">Bluetooth</div>' +
+  '<button id="mJournal">📄 TÉLÉCHARGER LE JOURNAL D’ERREURS</button>' +
+  '<button id="mEffacer" class="gris">EFFACER LE JOURNAL</button>' +
+  '<button id="mChanger" class="rouge">CHANGER DE MACHINE</button>' +
+  '<button id="mFermer" class="gris">FERMER</button></div>';
+function ouvrirMenu() {
+  menu.querySelector('#mTitre').textContent = chCmd ? 'Connecté à ' + (dev ? dev.name : '') : 'Bluetooth non connecté';
+  menu.style.display = 'flex';
+}
+menu.addEventListener('click', e => {
+  const id = e.target.id;
+  if (e.target === menu || id === 'mFermer') menu.style.display = 'none';
+  else if (id === 'mJournal') telechargerJournal(e.target);
+  else if (id === 'mEffacer') effacerJournal();
+  else if (id === 'mChanger') {
+    if (!confirm('Se déconnecter et choisir une autre machine ?')) return;
+    manuel = true; jlog('Déconnexion manuelle (changer de machine)');
+    try { dev && dev.gatt.disconnect(); } catch (_) {}
+    location.reload();
+  }
+});
 
 let dev = null, chCmd = null, machine = null, ecranCharge = false, manuel = false, enCours = false;
 let lastData = null, lastT = 0, attenteData = [];
@@ -192,6 +281,7 @@ function injecter(html) {
   document.body.innerHTML = doc.body.innerHTML;
   document.body.appendChild(perte);
   document.body.appendChild(badge);
+  document.body.appendChild(menu);
   for (const t of scripts) { const s = document.createElement('script'); s.textContent = t; document.body.appendChild(s); }
 }
 
@@ -238,6 +328,7 @@ function avecDelai(p, ms) {
 }
 function detail(e) {
   const t = 'Étape ' + etape + ' : ' + (e && (e.name ? e.name + ' – ' : '') + (e && e.message || e));
+  jlog('ERREUR connexion – ' + t);
   const el = $c('cDetail'); if (el) el.textContent = t;
   console.log('[BT]', t);
 }
@@ -279,8 +370,12 @@ async function connecter(d) {
       location.reload();   // autre machine ou nouveau programme dans l'ESP32
       return;
     }
-    etat(true); essais = 0;
+    etat(true);
+    jlog('Connecté à ' + dev.name + (essais ? ' (après ' + essais + ' essais)' : '') + ' – programme ESP32 ' + info.h);
+    essais = 0;
     const el = $c('cDetail'); if (el) el.textContent = '';
+    // heure locale de la tablette -> l'ESP32 peut dater son journal
+    commande('/heure?t=' + Math.round(Date.now() / 1000 - new Date().getTimezoneOffset() * 60)).catch(() => {});
   } catch (e) {
     detail(e);
     throw e;
@@ -289,6 +384,7 @@ async function connecter(d) {
 function perdu() {
   chCmd = null;
   if (manuel) return;
+  jlog('Bluetooth DÉCONNECTÉ' + (document.visibilityState !== 'visible' ? ' (app en arrière-plan / écran éteint)' : ''));
   if (ecranCharge) etat(false); else statut('Connexion perdue.');
   planifier(1000);
 }
@@ -308,22 +404,24 @@ async function chercher() {
   try { await connecter(d); } catch (e) { statut('Erreur : ' + e.message); planifier(2000); }
 }
 
-badge.addEventListener('click', () => {
-  if (confirm('Se déconnecter et choisir une autre machine ?')) {
-    manuel = true;
-    try { dev && dev.gatt.disconnect(); } catch (_) {}
-    location.reload();
-  }
-});
+badge.addEventListener('click', ouvrirMenu);
 
 // Plus de mesure depuis 3 s : ecran gris par-dessus (meme si la page de la machine ne le fait pas)
+let sansMesure = false, debutTrou = 0;
 setInterval(() => {
   if (!ecranCharge) return;
-  perte.style.display = (Date.now() - lastT > 3000) ? 'flex' : 'none';
+  const trou = Date.now() - lastT > 3000;
+  perte.style.display = trou ? 'flex' : 'none';
+  if (trou && !sansMesure) { sansMesure = true; debutTrou = lastT; jlog('PLUS DE MESURES depuis 3 s (Bluetooth ' + (chCmd ? 'encore connecté' : 'déconnecté') + ')'); }
+  if (!trou && sansMesure) { sansMesure = false; jlog('Mesures revenues après ' + Math.round((Date.now() - debutTrou) / 1000) + ' s'); }
 }, 500);
+document.addEventListener('visibilitychange', () => jlog(document.visibilityState === 'visible' ? 'App au premier plan' : 'App en arrière-plan / écran éteint'));
+window.addEventListener('pagehide', () => jlog('App fermée'));
 
 // ---- Demarrage ----
 $c('bChercher').addEventListener('click', chercher);
+$c('bJournal').addEventListener('click', e => telechargerJournal(e.target));
+jlog('App ouverte');
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
 if (!navigator.bluetooth) {
   statut('Bluetooth web indisponible ici : ouvrir avec Chrome sur la tablette Android.');
